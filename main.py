@@ -9,207 +9,241 @@ from threading import Thread, Lock
 import numpy as np
 import hailo
 
-# Hailo helpers
+# Hailo helper imports
 from hailo_apps_infra.hailo_rpi_common import (
     get_caps_from_pad,
     get_numpy_from_buffer,
     app_callback_class,
 )
 from hailo_apps_infra.detection_pipeline import GStreamerDetectionApp
+from hailo_apps_infra.pose_estimation_pipeline import GStreamerPoseEstimationApp
 
-########################################################################
-# 1. User-defined callback class
-########################################################################
+#######################################################################
+# 1. Helper: keypoints dictionary for COCO Pose
+#######################################################################
+def get_keypoints():
+    """
+    Return a dictionary mapping COCO keypoint names to their indices.
+    Example keys: 'left_eye', 'right_eye', 'left_ear', ...
+    """
+    return {
+        'nose': 0,
+        'left_eye': 1,
+        'right_eye': 2,
+        'left_ear': 3,
+        'right_ear': 4,
+        'left_shoulder': 5,
+        'right_shoulder': 6,
+        'left_elbow': 7,
+        'right_elbow': 8,
+        'left_wrist': 9,
+        'right_wrist': 10,
+        'left_hip': 11,
+        'right_hip': 12,
+        'left_knee': 13,
+        'right_knee': 14,
+        'left_ankle': 15,
+        'right_ankle': 16,
+    }
+
+KEYPOINTS_DICT = get_keypoints()
+
+#######################################################################
+# 2. User-defined callback class
+#######################################################################
 class UserAppCallback(app_callback_class):
     """
-    Inherit from hailo_apps_infra.hailo_rpi_common.app_callback_class
+    Extend hailo_apps_infra.hailo_rpi_common.app_callback_class
     so we can store frames & custom variables.
     """
     def __init__(self):
         super().__init__()
         self.lock = Lock()
-        self.latest_frame = None  # We'll store the most recent overlaid frame here.
+        self.latest_frame = None
 
     def set_frame(self, frame):
-        """Store the latest overlaid frame (thread-safe)."""
+        """Thread-safe setter for the latest overlaid frame."""
         with self.lock:
             self.latest_frame = frame
 
     def get_frame(self):
-        """Retrieve the latest overlaid frame (thread-safe)."""
+        """Thread-safe getter for the latest overlaid frame."""
         with self.lock:
             return self.latest_frame.copy() if self.latest_frame is not None else None
 
-
-########################################################################
-# 2. Callback function that GStreamer calls for every buffer (frame)
-########################################################################
+#######################################################################
+# 3. The GStreamer callback function
+#######################################################################
 def app_callback(pad, info, user_data):
-    """
-    pad:  The GStreamer pad giving us data
-    info: The probe info
-    user_data: Our UserAppCallback instance
-    """
+    # Retrieve the GstBuffer
     buffer = info.get_buffer()
     if buffer is None:
         return Gst.PadProbeReturn.OK
 
-    # Count frames (for example)
+    # Increment our frame counter
     user_data.increment()
     frame_number = user_data.get_count()
 
-    # Extract caps (format, width, height)
+    # Get the caps from the pad: format, width, height
     fmt, width, height = get_caps_from_pad(pad)
     if (not user_data.use_frame) or (fmt is None):
         return Gst.PadProbeReturn.OK
 
-    # Convert buffer to numpy
+    # Convert buffer to a NumPy array (typically in RGB)
     frame = get_numpy_from_buffer(buffer, fmt, width, height)
-    # frame from Hailo is typically in RGB, we can confirm that in your pipeline’s "video/x-raw,format=RGB" config.
 
-    # Retrieve detections from Hailo
+    # Extract detections from the hailo buffer
     roi = hailo.get_roi_from_buffer(buffer)
-    detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
+    detections = roi.get_objects_typed(hailo.HAILO_DETECTION)  # bounding boxes, labels, confidences
 
-    # Overlay detections
+    # This list might exist if your pipeline includes pose landmarks
+    # e.g. hailo.HAILO_LANDMARKS objects inside each detection
+    # We'll show how to draw them if present
     detection_count = 0
+
     for detection in detections:
+        detection_count += 1
         label = detection.get_label()
-        bbox = detection.get_bbox()  # x_min, y_min, x_max, y_max
+        bbox = detection.get_bbox()  # (x_min, y_min, x_max, y_max)
         confidence = detection.get_confidence()
 
-        # For instance, we only draw if it's a "person"
-        if label == "person":
-            detection_count += 1
+        # Draw bounding boxes (for object detection or "person" in pose)
+        x_min, y_min, x_max, y_max = map(int, bbox)
+        cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+        cv2.putText(frame,
+                    f"{label} {confidence:.2f}",
+                    (x_min, max(y_min - 5, 0)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-            # If you have tracking info
-            track = detection.get_objects_typed(hailo.HAILO_UNIQUE_ID)
-            track_id = track[0].get_id() if len(track) == 1 else 0
+        # Check for pose landmarks (if the pipeline is pose-based, or if
+        # the detection includes HAILO_LANDMARKS)
+        landmarks = detection.get_objects_typed(hailo.HAILO_LANDMARKS)
+        if len(landmarks) > 0:
+            # Typically there's just one landmarks object
+            pts = landmarks[0].get_points()  # keypoints in [0,1] relative coords
+            # We'll just demonstrate drawing eyes or all keypoints
+            for name, idx in KEYPOINTS_DICT.items():
+                # pts[idx] is the normalized location inside the bounding box
+                # point.x(), point.y() in range [0,1].
+                point = pts[idx]
+                # Convert from relative coords to absolute pixel coords
+                px = int((point.x() * bbox.width()) + bbox.xmin())
+                py = int((point.y() * bbox.height()) + bbox.ymin())
+                # Draw the keypoint
+                cv2.circle(frame, (px, py), 4, (255, 0, 0), -1)
+                # Optionally label it
+                # cv2.putText(frame, name, (px, py),
+                #             cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 0, 0), 1)
 
-            # Draw bounding box on the frame
-            x_min, y_min, x_max, y_max = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
-            cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
-            text_label = f"ID:{track_id} {label} {confidence:.2f}"
-            cv2.putText(frame, text_label, (x_min, y_min - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5, (0, 255, 0), 2)
+    # Overlay some debug text
+    cv2.putText(frame, f"Frame #{frame_number} / Detections: {detection_count}",
+                (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
 
-    # You can overlay any debug info you want
-    cv2.putText(frame, f"Frame #{frame_number}, Detections: {detection_count}",
-                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
-
-    # Convert back to BGR if needed for display in standard OpenCV window
+    # Convert to BGR for display in OpenCV
     frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-
-    # Store the frame in user_data so the main thread can display it
     user_data.set_frame(frame_bgr)
 
     return Gst.PadProbeReturn.OK
 
-
-########################################################################
-# 3. Main function
-########################################################################
+#######################################################################
+# 4. Main function: parse config, pick pipeline, show frames
+#######################################################################
 def main():
-    # -----------------------------------------------------------
-    # Parse CLI arguments (same approach as your RTSP script)
-    # -----------------------------------------------------------
-    parser = argparse.ArgumentParser(description='RTSP Stream Capture + Hailo Pose/Detection Overlay')
+    # ----------------------------------------------------------
+    # Parse CLI args
+    # ----------------------------------------------------------
+    parser = argparse.ArgumentParser(description='Hailo + OpenCV: Object or Pose')
     parser.add_argument('-config', type=str, default='config.yaml',
                         help='Path to the YAML configuration file')
     args = parser.parse_args()
 
     config_path = args.config if os.path.exists(args.config) else 'config.yaml'
     if not os.path.exists(config_path):
-        print(f"Error: Configuration file not found at {config_path}")
+        print(f"Error: Config file not found at {config_path}")
         return
 
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
-    username = config['username']
-    password = config['password']
-    camera_ip = config['camera_ip']
-    port = config['port']
+    username = config.get('username', '')
+    password = config.get('password', '')
+    camera_ip = config.get('camera_ip', '')
+    port = config.get('port', 554)
     stream_path = config.get('stream_path', '')
-    resize_percentage = config.get('resize_percentage', 50)
+    resize_pct = config.get('resize_percentage', 50)
 
-    # Construct the RTSP URL
+    # Are we doing object detection or pose?
+    mode = config.get('mode', 'object')  # "object" or "pose"
+    hailo_model_path = config.get('model_path', 'your_model.hailo')
+
+    # Construct RTSP URL
     if stream_path:
         rtsp_url = f'rtsp://{username}:{password}@{camera_ip}:{port}/{stream_path}'
     else:
         rtsp_url = f'rtsp://{username}:{password}@{camera_ip}:{port}'
 
-    # -----------------------------------------------------------
-    # Create our user_data callback class
-    # -----------------------------------------------------------
-    user_data = UserAppCallback()
-    # We want actual frames in our callback
-    user_data.use_frame = True
+    # ----------------------------------------------------------
+    # Create the pipeline string
+    # NOTE: Customize for your environment (decoder, hailonet args, etc.)
+    # ----------------------------------------------------------
+    # Typically for Hailo, we do something like:
+    #   rtspsrc location=... ! queue ! decodebin ! videoconvert ! video/x-raw,format=RGB !
+    #       hailonet model_path=... ! hailofilter ! ...
+    #
+    # For pose estimation, you may have "hailopostprocess" or other elements.
+    # The pipeline can differ slightly for object vs. pose. Adjust as needed.
 
-    # -----------------------------------------------------------
-    # Prepare the Hailo GStreamer detection pipeline
-    # -----------------------------------------------------------
-    #
-    # Typically, you have something like:
-    #
-    #  rtspsrc location=rtsp://... ! queue ! decodebin ! videoconvert ! video/x-raw,format=RGB ! \
-    #       hailonet model_path=<your_model.hailo> ! hailofilter ! appsink ...
-    #
-    # The exact pipeline depends on your model, Hailo plugin versions, etc.
-    # Adjust as needed (latency, decodebin, etc.). Also note if you need
-    #  "hailopostprocess" or other plugin elements in your chain.
-    #
-    # The key is that at the end we have an appsink with "emit-signals=True"
-    # so GStreamerDetectionApp can attach the callback.
-    #
+    # Minimal example that goes to an appsink:
     pipeline = (
         f"rtspsrc latency=200 location={rtsp_url} ! "
         "queue ! decodebin ! "
         "videoconvert ! video/x-raw,format=RGB ! "
-        # Replace with your actual Hailo elements:
-        "hailonet name=net model_path=your_model.hailo ! "
+        f"hailonet name=net model_path={hailo_model_path} ! "
         "hailofilter name=filter ! "
         "appsink emit-signals=True name=sink max-buffers=1 drop=true"
     )
 
-    # -----------------------------------------------------------
-    # Initialize GStreamerDetectionApp
-    #   - The first arg is the callback function
-    #   - The second arg is the user_data object
-    #   - The third arg is the pipeline string
-    # -----------------------------------------------------------
-    app = GStreamerDetectionApp(app_callback, user_data, pipeline)
+    # ----------------------------------------------------------
+    # Create user_data object and pipeline class
+    # ----------------------------------------------------------
+    user_data = UserAppCallback()
+    user_data.use_frame = True  # we want actual frames in callback
 
-    # We'll run the GStreamer pipeline in a separate thread
+    if mode.lower() == "pose":
+        # Pose Estimation pipeline
+        app = GStreamerPoseEstimationApp(app_callback, user_data, pipeline)
+    else:
+        # Object Detection pipeline
+        app = GStreamerDetectionApp(app_callback, user_data, pipeline)
+
+    # ----------------------------------------------------------
+    # Launch pipeline in a separate thread
+    # ----------------------------------------------------------
     gst_thread = Thread(target=app.run)
     gst_thread.start()
 
-    # -----------------------------------------------------------
-    # MAIN LOOP: Retrieve frames from user_data, show with OpenCV
-    # -----------------------------------------------------------
-    cv2.namedWindow("RTSP + Hailo Detections", cv2.WINDOW_NORMAL)
+    # ----------------------------------------------------------
+    # Main Loop: display frames in OpenCV
+    # ----------------------------------------------------------
+    cv2.namedWindow("Hailo Stream", cv2.WINDOW_NORMAL)
     while True:
         frame_bgr = user_data.get_frame()
         if frame_bgr is not None:
-            # Optionally resize for display:
-            height, width = frame_bgr.shape[:2]
-            new_width = int(width * (resize_percentage / 100))
-            new_height = int(height * (resize_percentage / 100))
-            resized_frame = cv2.resize(frame_bgr, (new_width, new_height))
+            h, w = frame_bgr.shape[:2]
+            new_w = int(w * (resize_pct / 100.0))
+            new_h = int(h * (resize_pct / 100.0))
+            resized_frame = cv2.resize(frame_bgr, (new_w, new_h))
+            cv2.imshow("Hailo Stream", resized_frame)
 
-            cv2.imshow("RTSP + Hailo Detections", resized_frame)
-
-        # Press 'q' to quit
         if cv2.waitKey(1) & 0xFF == ord('q'):
-            # Graceful shutdown
-            app.stop()  # Tells GStreamerDetectionApp to stop main pipeline loop
+            app.stop()  # Gracefully stop the pipeline
             break
 
     gst_thread.join()
     cv2.destroyAllWindows()
 
-########################################################################
-# 4. Entry point
-########################################################################
+#######################################################################
+# 5. Entry point
+#######################################################################
 if __name__ == "__main__":
     main()

@@ -1,0 +1,9 @@
+username: "user"
+password: "pass"
+camera_ip: "192.168.1.10"
+port: 554
+stream_path: ""
+resize_percentage: 50
+mode: "pose"   # or "object"
+model_path: "/path/to/your_pose_model.hailo"   # for pose
+# model_path: "/path/to/your_object_model.hailo"  # for object
